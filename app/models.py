@@ -44,6 +44,61 @@ class BuildCreate(BaseModel):
     steps: Annotated[list[StepIn], Field(min_length=1, max_length=config.MAX_STEPS)]
 
 
+# 共享订阅的状态机：active 有效 / revoked 已撤销（终态，不复活）
+SUBSCRIPTION_ACTIVE = "active"
+SUBSCRIPTION_REVOKED = "revoked"
+
+
+class SharedBuildCreate(BaseModel):
+    """共享构建提交：构建定义 + 共享键 + 订阅者键。"""
+
+    share_key: Annotated[str, Field(min_length=1, max_length=128)]
+    subscriber_key: Annotated[str, Field(min_length=1, max_length=128)]
+    build: BuildCreate
+
+    @field_validator("share_key", "subscriber_key")
+    @classmethod
+    def _key_format(cls, v: str) -> str:
+        # 键会出现在 URL 路径中，禁止空白与路径保留字符
+        if any(ch.isspace() for ch in v):
+            raise ValueError("键不允许包含空白字符")
+        if any(ch in v for ch in "/?#"):
+            raise ValueError("键不允许包含 / ? # 字符")
+        return v
+
+
+class SharedSubscriptionOut(BaseModel):
+    share_key: str
+    subscriber_key: str
+    subscription_status: str
+    build_id: int
+    build_status: str
+    subscribed_at: str
+    revoked_at: Optional[str]
+    detail: str
+
+
+class SharedGroupOut(BaseModel):
+    share_key: str
+    definition_hash: str
+    build_id: int
+    build_status: str
+    build_cancel_requested: bool
+    created_at: str
+    active_subscriptions: int
+    subscriptions: list[SharedSubscriptionOut]
+
+
+class SharedRevokeOut(BaseModel):
+    share_key: str
+    subscriber_key: str
+    subscription_status: str
+    build_id: int
+    build_status: str
+    build_cancel_triggered: bool
+    detail: str
+
+
 class StepOut(BaseModel):
     id: str
     command: str

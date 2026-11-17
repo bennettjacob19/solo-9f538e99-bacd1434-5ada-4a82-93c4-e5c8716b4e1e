@@ -38,6 +38,25 @@ CREATE TABLE IF NOT EXISTS steps (
     UNIQUE(build_id, step_uid),
     FOREIGN KEY(build_id) REFERENCES builds(id)
 );
+CREATE TABLE IF NOT EXISTS shared_groups (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    share_key        TEXT NOT NULL UNIQUE,
+    definition_hash  TEXT NOT NULL,
+    definition_json  TEXT NOT NULL,
+    build_id         INTEGER NOT NULL,
+    created_at       TEXT NOT NULL,
+    FOREIGN KEY(build_id) REFERENCES builds(id)
+);
+CREATE TABLE IF NOT EXISTS shared_subscriptions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id        INTEGER NOT NULL,
+    subscriber_key  TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    revoked_at      TEXT,
+    UNIQUE(group_id, subscriber_key),
+    FOREIGN KEY(group_id) REFERENCES shared_groups(id)
+);
 """
 
 
@@ -205,3 +224,83 @@ class Database:
             f"SELECT * FROM steps WHERE build_id IN ({placeholders}) ORDER BY id",
             build_ids,
         )
+
+    # ---- 共享构建 -------------------------------------------------------
+
+    async def create_shared_group(
+        self,
+        share_key: str,
+        definition_hash: str,
+        definition_json: str,
+        build_id: int,
+        now: str,
+    ) -> int:
+        return await self.execute(
+            """
+            INSERT INTO shared_groups
+                (share_key, definition_hash, definition_json, build_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (share_key, definition_hash, definition_json, build_id, now),
+        )
+
+    async def get_shared_group_by_key(self, share_key: str) -> Optional[aiosqlite.Row]:
+        return await self.one(
+            "SELECT * FROM shared_groups WHERE share_key=?", (share_key,)
+        )
+
+    async def get_shared_group_by_build_id(self, build_id: int) -> Optional[aiosqlite.Row]:
+        return await self.one(
+            "SELECT * FROM shared_groups WHERE build_id=?", (build_id,)
+        )
+
+    async def list_shared_groups(self, limit: int = 100) -> list[aiosqlite.Row]:
+        return await self.all(
+            "SELECT * FROM shared_groups ORDER BY id DESC LIMIT ?", (limit,)
+        )
+
+    async def create_shared_subscription(
+        self, group_id: int, subscriber_key: str, now: str
+    ) -> int:
+        return await self.execute(
+            "INSERT INTO shared_subscriptions (group_id, subscriber_key, status, created_at) "
+            "VALUES (?, ?, 'active', ?)",
+            (group_id, subscriber_key, now),
+        )
+
+    async def get_shared_subscription(
+        self, group_id: int, subscriber_key: str
+    ) -> Optional[aiosqlite.Row]:
+        return await self.one(
+            "SELECT * FROM shared_subscriptions WHERE group_id=? AND subscriber_key=?",
+            (group_id, subscriber_key),
+        )
+
+    async def list_shared_subscriptions(self, group_id: int) -> list[aiosqlite.Row]:
+        return await self.all(
+            "SELECT * FROM shared_subscriptions WHERE group_id=? ORDER BY id",
+            (group_id,),
+        )
+
+    async def revoke_shared_subscription(self, sub_id: int, now: str) -> None:
+        # 只翻 active -> revoked；重复撤销由上层幂等处理，这里不加写
+        await self.execute(
+            "UPDATE shared_subscriptions SET status='revoked', revoked_at=? "
+            "WHERE id=? AND status='active'",
+            (now, sub_id),
+        )
+
+    async def count_active_subscriptions(self, group_id: int) -> int:
+        row = await self.one(
+            "SELECT COUNT(*) AS c FROM shared_subscriptions "
+            "WHERE group_id=? AND status='active'",
+            (group_id,),
+        )
+        return int(row["c"])
+
+    async def delete_shared_group(self, group_id: int) -> None:
+        """共享关系落库失败时的补偿清理（正常流程不会用到）。"""
+        await self.execute(
+            "DELETE FROM shared_subscriptions WHERE group_id=?", (group_id,)
+        )
+        await self.execute("DELETE FROM shared_groups WHERE id=?", (group_id,))

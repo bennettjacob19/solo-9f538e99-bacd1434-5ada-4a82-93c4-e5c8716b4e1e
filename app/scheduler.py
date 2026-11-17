@@ -37,6 +37,16 @@ class Scheduler:
     # ------------------------------------------------------------------ API
 
     async def submit(self, payload: BuildCreate) -> int:
+        build_id = await self.prepare_build(payload)
+        self.launch_build(build_id)
+        return build_id
+
+    async def prepare_build(self, payload: BuildCreate) -> int:
+        """校验并落库构建/步骤记录，但不启动调度。
+
+        与 launch_build 分离：共享构建流程需要在共享关系落库确认后才启动
+        构建任务，调用方（共享服务）在持锁期间编排这两步。
+        """
         validate_dag(payload.steps)  # ValueError 由路由层转 400
         build_id = await self.db.create_build(payload.name, _now())
         log_dir = config.LOG_ROOT / str(build_id)
@@ -52,10 +62,13 @@ class Scheduler:
                 step.timeout_seconds,
                 str(log_path),
             )
+        return build_id
+
+    def launch_build(self, build_id: int) -> None:
+        """为已落库的构建启动调度任务。"""
         task = asyncio.create_task(self._run_build(build_id), name=f"build-{build_id}")
         self._build_tasks[build_id] = task
         task.add_done_callback(self._log_task_exception)
-        return build_id
 
     async def cancel(self, build_id: int) -> tuple[Optional[dict[str, Any]], str]:
         """返回 (构建行或 None, 说明)。重复取消幂等，不改变已定终态。"""
@@ -152,6 +165,13 @@ class Scheduler:
         # (步骤 uid, 步骤任务) 成对保存，避免用任务名反解 uid
         step_tasks: list[tuple[str, asyncio.Task[str]]] = []
         try:
+            # 取消请求可能先于构建任务落达（例如共享构建最后一个订阅在
+            # 任务启动前被撤销，cancel 时 _build_events 里还没有 event）：
+            # 以落库的 cancel_requested 为准，启动即进入取消流程，
+            # 保证"全部撤销后不再启动任何命令"。
+            row = await self.db.get_build(build_id)
+            if row is not None and row["cancel_requested"]:
+                event.set()
             await self.db.set_build_status(
                 build_id, "running", _now(), started=True
             )
